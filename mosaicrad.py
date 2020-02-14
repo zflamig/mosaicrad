@@ -5,6 +5,14 @@ from datetime import timedelta
 import datetime
 import os
 import pyart
+import osgeo.osr as osr
+import osgeo.gdal as gdal
+import numpy as np
+
+LIMITS_Y = (20.0, 55.0)
+LIMITS_X = (-130.0, -60.0)
+LIMITS_NX = 7000
+LIMITS_NY = 3500
 
 s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
@@ -32,7 +40,7 @@ def get_nexrad_files_before(
                 key = obj["Key"]
 
                 # We don't care about this file, it is something weird
-                if "_MDM" in key:
+                if "_MDM" in key or ".tar" in key:
                     continue
 
                 parts = key.split("/")
@@ -82,16 +90,40 @@ def mosaic_radars(radars, path="/tmp/"):
 
     gridded = pyart.map.map_to_grid(
         radars_data,
-        grid_shape=(3, 3500, 7000),
-        grid_limits=((0.0, 19000.0), (20.0, 50.0), (-130.0, -60.0)),
-        grid_projection="+init=EPSG:4326",
+        grid_shape=(3, LIMITS_NY, LIMITS_NX),
+        grid_limits=((0.0, 3000.0), LIMITS_Y, LIMITS_X),
+        grid_origin_alt=0.0,
+        grid_projection={"init": "EPSG:4326"},
         fields=["reflectivity"],
-        min_radius=30,
+        min_radius=1.0,
         bsp=0.,
         h_factor=0.,
         max_refl=100,
+        weighting_function="nearest",
     )
-    gridded.write(path + "grid")
+    
+    return gridded
+
+def write_grid(data, output_file):
+    driver = gdal.GetDriverByName("GTiff")
+    ny, nx = data.shape
+    dst_ds = driver.Create(output_file, nx, ny, 1, gdal.GDT_Float32)
+
+    y_res = (LIMITS_Y[1] - LIMITS_Y[0]) / ny
+    x_res = (LIMITS_X[1] - LIMITS_X[0]) / nx
+
+    gt = (LIMITS_X[0], x_res, 0, LIMITS_Y[1], 0, -y_res)
+    dst_ds.SetGeoTransform(gt)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    dst_ds.SetProjection(srs.ExportToWkt())
+    data = data.filled(-9999.0)
+
+    data = np.flipud(data)
+    dst_ds.GetRasterBand(1).WriteArray(data, 0, 0)
+    dst_ds.GetRasterBand(1).SetNoDataValue(-9999.0)
+
+    dst_ds = None
 
 
 valid_time = datetime.datetime.utcnow().replace(
@@ -102,4 +134,6 @@ radar_files = get_nexrad_files_before(valid_time)
 print("Downloading")
 download_for_radars(radar_files)
 print("gridding")
-mosaic_radars(radar_files)
+gridded = mosaic_radars(radar_files)
+print("saving")
+write_grid(gridded["reflectivity"][1], "/tmp/grid.tif")
